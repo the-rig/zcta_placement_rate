@@ -1,0 +1,17 @@
+base
+tidycensus
+odbc
+sp
+rgdal
+readxl
+httr
+rgeos
+Matrix
+spData
+spdep
+leaflet
+scales
+feather
+dplyr
+ggplot2
+bindrcpp

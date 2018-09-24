@@ -1,0 +1,523 @@
+---
+title: "Calculating Foster Care Placement Rates by ZCTA in Washington STate"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background
+
+These rates are part of a larger project exploring foster care supply and demand in Washington State. Part of the demand equation for foster care is the rate of new placements in foster care, at varying levels of geography. 
+
+Here, we outline the calculation of Placement Rates, by ZCTA using the statistical programming language R. 
+
+## Load Libraries 
+
+The first chunk of code below loads necessary libraries and defines some objects which will be used throughout the analysis. The DSN will specified will depend on how a particular reader connects to the FamLink Data Warehouse. Individual API keys for the US Census can be found here: [https://api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html).
+
+```{r load_libraries, message=FALSE, warning=FALSE}
+library(tidycensus) # to connect to the Census API
+library(odbc) # to connect to the FamLink Data Warehouse (FLDW)
+library(rgdal) # for mapping 
+library(readxl) # for reading a zip code <-> ZCTA cross walk
+library(httr) # for adding labels to the map
+library(rgeos) # for mapping
+library(spdep) # for calculating distance matrices
+library(leaflet) # for mapping
+library(scales) # for number formatting
+library(feather) # for storing data
+library(dplyr) # for data wrangling 
+library(ggplot2) # for plotting
+
+# define a connection to the DSN "POC" - this is the DB where our FLDW extract is stored
+con <- dbConnect(odbc::odbc(), "POC")
+
+#tell your R install where your Census API key is located
+#census_api_key("YourCensusAPIKey", install = TRUE) #only run once
+
+```
+
+## Get Crosswalk
+
+Since Zip Codes (what we have recorded in FamLink) and ZCTAs (what the Census uses to categorize data) do not align perfectly, we also obtain a crosswalk available to the public from HRSA's [UDS Mapper Project](https://www.udsmapper.org/about.cfm). 
+
+```{r zcta_cross_walk, message=FALSE, warning=FALSE}
+xwalk_url <- "https://www.udsmapper.org/docs/zip_to_zcta_2018.xlsx"
+xwalk_file <- GET(xwalk_url, write_disk(tf <- tempfile(fileext = ".xlsx"), overwrite = TRUE))
+dat_xwalk <- readxl::read_excel(tf)
+
+# for use later in our shiny app
+xwalk_path <- "dat_xwalk.feather"
+write_feather(dat_xwalk, xwalk_path)
+```
+
+## Get Placement Data
+
+The next section generates placement counts from the aforementioned FLDW. We then join those results to the ZCTA crosswalk. The inner join will exclude any FamLink zip codes which are either not specified or missing. Recent analysis suggests that FamLink placements have valid origin zip codes (i.e. the zip code from which the child was originally removed) for about 95% of placements. 
+
+```{r zcta_placement_counts, message=FALSE, warning=FALSE}
+# get placement counts, and join to zcta cross-walk
+# the result of this inner join is a placement count for 
+# all valid zip codes in FamLink (about 95% of placements)
+placement_counts <- DBI::dbGetQuery(conn = con
+                                  ,"
+with zip_year_variable as
+(
+select
+	rp.zip
+	,year(rp.removal_dt) placement_year
+	,case
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 5 
+			then 'B01001_003'--'Male:!!Under 5 years'
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 5 and 9 
+			then 'B01001_004' --'Male:!!5 to 9 years'
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 10 and 14 
+			then 'B01001_005' --'Male:!!10 to 14 years'
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 15 and 17 
+			then 'B01001_006' --'Male:!!15 to 17 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 5 
+			then 'B01001_027' --'Female:!!Under 5 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 5 and 9 
+			then 'B01001_028' --'Female:!!5 to 9 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 10 and 14 
+			then 'B01001_029' --'Female:!!10 to 14 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 15 and 17 
+			then 'B01001_030' --'Female:!!15 to 17 years'
+	end variable
+	,'zip_year_variable' data_key
+	,count(distinct child) placement_count
+from base.rptPlacement rp
+where rp.removal_dt between '2011-01-01' and '2016-12-31'
+	and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 18
+group by
+	rp.zip
+	,year(rp.removal_dt)
+	,case
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 5 
+			then 'B01001_003'--'Male:!!Under 5 years'
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 5 and 9 
+			then 'B01001_004' --'Male:!!5 to 9 years'
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 10 and 14 
+			then 'B01001_005' --'Male:!!10 to 14 years'
+		when rp.cd_gndr = 'M' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 15 and 17 
+			then 'B01001_006' --'Male:!!15 to 17 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 5 
+			then 'B01001_027' --'Female:!!Under 5 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 5 and 9 
+			then 'B01001_028' --'Female:!!5 to 9 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 10 and 14 
+			then 'B01001_029' --'Female:!!10 to 14 years'
+		when rp.cd_gndr = 'F' and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) between 15 and 17 
+			then 'B01001_030' --'Female:!!15 to 17 years'
+	end
+), zip_year_prep as
+(
+select
+	rp.zip
+	,year(rp.removal_dt) placement_year
+	,null variable
+	,count(distinct child) placement_count
+	,'zip_year' data_key
+from base.rptPlacement rp
+where rp.removal_dt between '2011-01-01' and '2016-12-31'
+	and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 18
+group by
+	rp.zip
+	,year(rp.removal_dt)
+), zip_year as
+(
+select
+cast(zip as varchar) zip
+	,placement_year
+	,null variable
+	,avg(placement_count) placement_count
+	,'zip_year' data_key
+from zip_year_prep
+group by
+	cast(zip as varchar)
+	,placement_year
+), zip_prep as
+(
+select
+	rp.zip
+	,null placement_year
+	,null variable
+	,'zip' data_key
+	,count(distinct child) placement_count
+from base.rptPlacement rp
+where rp.removal_dt between '2011-01-01' and '2016-12-31'
+	and dbo.fnc_datediff_yrs(rp.birthdate, rp.removal_dt) < 18
+group by
+	rp.zip
+), zip as
+(
+select
+	cast(zip as varchar) zip
+	,placement_year
+	,variable
+	,data_key
+	,avg(placement_count) placement_count
+from zip_prep
+group by
+	cast(zip as varchar)
+	,placement_year
+	,variable
+	,data_key
+)
+
+select
+	cast(zip as varchar) zip
+	,placement_year year
+	,variable
+	,data_key
+	,placement_count
+from zip
+union all
+select
+	cast(zip as varchar) zip
+	,placement_year
+	,variable
+	,data_key
+	,placement_count
+from zip_year
+union all
+select
+	cast(zip as varchar) zip
+	,placement_year
+	,variable
+	,data_key
+	,placement_count
+from zip_year_variable
+                                  ") %>%
+  inner_join(dat_xwalk, by = c("zip" = "ZIP_CODE"))
+
+pc_path <- "placement_counts.feather"
+write_feather(placement_counts, pc_path) 
+
+```
+
+## Get Population Data
+
+The next section generates population estimates from the US Census. We specifically make use of the 5-year ACS estimates. As of the date of this writing, the most recent ACS data available are 2016. 
+
+```{r zcta_pop_counts, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+
+# Get ACS population estimates for Washington ZCTAs, from 2011 through 2016
+
+zctalist = list()
+
+for (i in 2011:2016) {
+  print(i)
+  zc <- get_acs(geography = "zcta"
+                ,geometry = FALSE
+                ,variables = c("B01001_027E", "B01001_028E"
+                               ,"B01001_029E", "B01001_030E" #female kids
+                               ,"B01001_003E", "B01001_004E"
+                               ,"B01001_005E", "B01001_006E") #male kids
+                ,year = i) %>%
+   filter(substr(GEOID, 1, 3) %>% as.numeric >= 980
+           ,substr(GEOID, 1, 3) %>% as.numeric <= 994)
+  
+ zc$year <- i
+  
+  zctalist[[i]] <- zc
+}
+
+# for use later in shiny 
+path <- "zcta_counts.feather"
+write_feather(bind_rows(zctalist), path)
+```
+
+## Join and Aggregate the Data 
+
+Our next chunk joins the census and FamLink data together. We first rename the fields in each file together to make clear that we are conducting a ZCTA analysis, not a ZIP-code analysis. The `left_join` function joins the two data sets together on the year, zcta, and variable fields. We then average the population and placement counts across all of the years of data, and then sum across the age categories. 
+
+After cleaning up those aggregations which come from low population ZCTAs, we finally calculate an expected removal rate.
+
+```{r zcta_aggr_counts, message=FALSE, warning=FALSE, cache=TRUE}
+
+zcta_counts <- read_feather("zcta_counts.feather") %>%
+  rename(zcta = GEOID)
+
+placement_counts <- placement_counts %>%
+  rename(zcta = ZCTA)
+ 
+dat_aggr <- left_join(zcta_counts, placement_counts) %>%
+  group_by(zcta, variable) %>%
+  # average across years
+  summarise(avg_estimate = mean(estimate, na.rm = TRUE)
+            ,avg_placements = mean(placement_count, na.rm = TRUE)
+            ,avg_moe = mean(moe, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(zcta) %>%
+  # sum across age groups
+  summarise(ttl_expected_children = sum(avg_estimate, na.rm = TRUE)
+            ,ttl_expected_placements = sum(avg_placements, na.rm = TRUE)
+            ,avg_moe = mean(avg_moe, na.rm = TRUE)) %>%
+  # clean up some small pop zip codes 
+  mutate(ttl_expected_placements = ifelse(is.na(ttl_expected_placements)
+                                    ,0, ttl_expected_placements)
+         ,ttl_expected_children = ifelse(avg_moe > 0 & ttl_expected_children == 0
+                                ,avg_moe/2, ttl_expected_children)
+         ,ttl_expected_placement_rate = ttl_expected_placements/ttl_expected_children
+         ,ttl_expected_placement_rate = ifelse(ttl_expected_placement_rate < 0
+                                             ,0, ttl_expected_placement_rate)
+  )
+
+path <- "dat_aggr.feather"
+write_feather(dat_aggr, path)
+```
+
+## Weight By Neighboring ZCTAs
+
+Since ZCTAs are somewhat arbitrary boundaries, we take an additional step of weighting the rates calculated above by neighboring ZCTAs. In order to complete this task, we first load some ZCTA boundary data, also available from the US Census.
+
+We next calculate the centroid of each ZCTA in the boundary file. We then find near neighbors to each ZCTA centroid. We specifically look for any ZCTA that is within 20 km of another ZCTA. For each ZCTA, the vector of inverse distances (i.e. 1/distance) for each neighbor is multiplied against the placement rate for the neighbor. All values (along with the value for the ZCTA in question) are then averaged together. The result, for each ZCTA is a weighted average of local placement rates.
+
+These new calculations (along with the unweighted calculations) are then combined with the ZCTA boundary data for plotting. 
+
+```{r zcta_maps, message=FALSE, warning=FALSE, cache=TRUE}
+
+# Get geographic data
+
+wa <- readOGR("wa_2016_zcta_trim_Project.shp",
+              layer = "wa_2016_zcta_trim_Project")
+
+wa_cent <- coordinates(wa)
+
+wa_wd10 <- dnearneigh(wa_cent, 0, 20, row.names = wa$GEOID10, longlat = TRUE)
+
+wa_distances <- nbdists(wa_wd10, wa_cent, longlat = TRUE)
+
+names(wa_distances) <- as.character(wa$GEOID10)
+
+wa_weighted <- bind_rows(
+  stack(setNames(wa_distances, names(wa_distances))) %>%
+    mutate(values = 10e-02*(1/values))
+  ,data_frame(values = 1, ind = names(wa_distances))
+) %>%
+  left_join(dat_aggr, by = c("ind" = "zcta")) %>%
+  mutate(weighted = values*ttl_expected_placement_rate) %>%
+  group_by(ind) %>%
+  summarise(avg_weighted_placement_rate = mean(weighted))
+
+wa@data <- wa@data %>%
+  left_join(wa_weighted, by = c("GEOID10" = "ind")) %>%
+  left_join(dat_aggr, by = c("GEOID10" = "zcta"))
+
+wa <- spTransform(wa, CRS("+init=epsg:4326"))
+
+wa_clean <- gBuffer(wa, byid=TRUE, width=0)
+
+wa_fort <- fortify(wa_clean, region = "GEOID10") %>%
+  inner_join(wa@data, by = c("id" = "GEOID10"))
+
+label_creator <- function(label_vector, round_digits) {
+  
+  label_vector_length <- length(label_vector)-1
+  
+  increment <- 1/(1*(10^round_digits))
+  
+  labels <- vector(length = label_vector_length
+                   ,mode = "character")
+  
+  last_label <- paste0(round(label_vector[label_vector_length]+increment, round_digits)
+                       ," to "
+                       ,round(label_vector[label_vector_length + 1], round_digits))
+
+  first_label <- paste0("Under "
+                        ,round(label_vector[2], round_digits))  
+  
+  labels[1] <- first_label
+  labels[label_vector_length] <- last_label
+  
+  for (i in 2:(label_vector_length-1)){
+      label_i <- paste0(round(label_vector[i]+increment, round_digits)
+                        ," to "
+                        ,round(label_vector[i+1], round_digits))
+      labels[i] <- label_i
+  }
+  
+  labels
+  
+}
+
+unweighted_qtile <- quantile(wa_fort$ttl_expected_placement_rate)
+
+
+wa_fort$unweighted_factor <- factor(
+    cut(wa_fort$ttl_expected_placement_rate
+        ,unweighted_qtile
+        ,include.lowest = TRUE
+        ,right = TRUE),
+    labels = label_creator(label_vector = unweighted_qtile*1000
+                           ,round_digits = 1)
+)
+
+weighted_qtile <- quantile(wa_fort$avg_weighted_placement_rate)
+
+wa_fort$weighted_factor <- factor(
+    cut(wa_fort$avg_weighted_placement_rate
+        ,weighted_qtile
+        ,include.lowest = TRUE
+        ,right = TRUE),
+    labels = label_creator(label_vector = weighted_qtile*1000
+                           ,round_digits = 1)
+)
+
+write_feather(wa_clean@data, "weighted_and_raw.feather")
+
+```
+
+We first plot the unweighted values. 
+
+
+```{r zcta_plotting_ggplot, message=FALSE, warning=FALSE, cache=TRUE, fig.width=10,fig.height=11}
+
+ggplot(wa_fort, aes(x = long
+                    ,y = lat
+                    ,group = group
+                    ,fill = unweighted_factor)) +
+  geom_polygon(color = "grey10", size = 0.2) +
+  coord_map(projection = "bonne", param=45) + 
+  viridis::scale_fill_viridis(discrete = TRUE) +
+    labs(x = NULL, y = NULL, fill = NULL,
+         title = "Placements per Child",
+         subtitle = "Density per 1,000 Children, Averages over 2011-2016",
+         caption = paste("J. Mienko :: socialwork.uw.edu",
+"Data: US Census (2011-2016) & FamLink Data Warehouse (2013)",
+"Blank spaces indicate effectively 'unpopulated' ZCTAs",
+"For internal UW/DCYF use only. Please do not distribute without authorization.",
+            sep = "\n")) +
+    theme_void() +
+    theme(text = element_text(family = "Arial Narrow", size = 8),
+          plot.title = element_text(size = 12, face = "bold"),
+          plot.margin = unit(c(0, .1, 0.0, .1), "in"),
+          legend.key.width = unit(1, "line"), 
+          legend.key.height = unit(1, "line"), 
+          panel.border = element_rect(fill = NA, colour = "#cccccc"),
+          legend.text = element_text(size = 8),
+          legend.position = c(0.1, 0.14))
+
+
+```
+
+We next plot the weighted values. As can be seen, the weighting tends to smooth the variation throughout the state. 
+
+```{r zcta_plotting_ggplot_weighted, message=FALSE, warning=FALSE, cache=TRUE, fig.width=10,fig.height=11}
+
+ggplot(wa_fort, aes(x = long
+                    ,y = lat
+                    ,group = group
+                    ,fill = weighted_factor)) +
+  geom_polygon(color = "grey10", size = 0.2) +
+  coord_map(projection = "bonne", param=45) + 
+  viridis::scale_fill_viridis(discrete = TRUE) +
+    labs(x = NULL, y = NULL, fill = NULL,
+         title = "Placements per Child",
+         subtitle = "Density per 1,000 Children, Averages over 2011-2016, Weighted by 'Near Neighbors'",
+         caption = paste("J. Mienko :: socialwork.uw.edu",
+"Data: US Census (2011-2016) & FamLink Data Warehouse (2013)",
+"Blank spaces indicate effectively 'unpopulated' ZCTAs",
+"For internal UW/DCYF use only. Please do not distribute without authorization.",
+            sep = "\n")) +
+    theme_void() +
+    theme(text = element_text(family = "Arial Narrow", size = 8),
+          plot.title = element_text(size = 12, face = "bold"),
+          plot.margin = unit(c(0, .1, 0.0, .1), "in"),
+          legend.key.width = unit(1, "line"), 
+          legend.key.height = unit(1, "line"), 
+          panel.border = element_rect(fill = NA, colour = "#cccccc"),
+          legend.text = element_text(size = 8),
+          legend.position = c(0.1, 0.14))
+
+```
+
+
+The ZCTA geometry takes a lot of computational power to plot. In order to produce an easily shareable graphic which can be distributed over the web, we use the following code to plot circle markers at the centroid of each ZCTA. Each marker is colored and sized according to the placement rate. 
+
+
+```{r zcta_plotting_shiny, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
+
+labels_weighted <- sprintf(
+  "<strong>ZCTA %s</strong><br/>%g removals / child",
+  wa$ZCTA5CE10, round(wa$avg_weighted_placement_rate, 4)
+) %>% lapply(htmltools::HTML)
+
+labels_unweighted <- sprintf(
+  "<strong>ZCTA %s</strong><br/>%g removals / child",
+  wa$ZCTA5CE10, round(wa$ttl_expected_placement_rate, 4)
+) %>% lapply(htmltools::HTML)
+
+quantiles_weighted <- quantile(wa@data$avg_weighted_placement_rate
+                       ,probs = c(0, .25, .5, .75, .90, .95, .99, 1))
+
+quantiles_unweighted <- quantile(wa@data$ttl_expected_placement_rate
+                       ,probs = c(0, .25, .5, .75, .90, .95, .99, 1))
+
+pal_weighted <- colorBin("RdYlBu"
+                 ,domain = wa@data$avg_weighted_placement_rate
+                 ,bins = quantiles_weighted
+                 ,reverse = TRUE)
+
+pal_unweighted <- colorBin("RdYlBu"
+                 ,domain = wa@data$ttl_expected_placement_rate
+                 ,bins = quantiles_unweighted
+                 ,reverse = TRUE)
+
+mu <- wa$ttl_expected_placement_rate %>% mean
+lambda <- wa$ttl_expected_placement_rate %>% sd
+
+m <- leaflet(wa) %>% 
+  addProviderTiles(providers$OpenStreetMap.BlackAndWhite) %>%
+  setView(lng = -120.7401, lat = 47.5, zoom = 6.5) %>% 
+  addCircleMarkers(group = "Weighted Estimates"
+                   ,radius = ~(5*exp(avg_weighted_placement_rate-mu/1.5*lambda))
+                   ,fillOpacity = 0.9
+                   ,stroke = FALSE
+                   ,color = ~pal_weighted(avg_weighted_placement_rate)
+                   ,lng = ~INTPTLON10 %>% as.character %>% as.numeric
+                   ,lat = ~INTPTLAT10 %>% as.character %>% as.numeric
+                   ,popup = labels_weighted
+                   ,popupOptions = popupOptions(
+                     style = list("font-weight" = "normal", padding = "3px 8px"),
+                     textsize = "15px",
+                     direction = "auto")) %>%
+  addCircleMarkers(group = "Unweighted Estimates"
+                   ,radius = ~(5*exp(ttl_expected_placement_rate-mu/1.5*lambda))
+                   ,fillOpacity = 0.9
+                   ,stroke = FALSE
+                   ,color = ~pal_unweighted(ttl_expected_placement_rate)
+                   ,lng = ~INTPTLON10 %>% as.character %>% as.numeric
+                   ,lat = ~INTPTLAT10 %>% as.character %>% as.numeric
+                   ,popup = labels_unweighted
+                   ,popupOptions = popupOptions(
+                     style = list("font-weight" = "normal", padding = "3px 8px"),
+                     textsize = "15px",
+                     direction = "auto")) %>%
+  addLegend(group = "Weighted Estimates", pal = pal_weighted
+            , values = ~avg_weighted_placement_rate, opacity = 0.7
+            , title = "Mean Removal Rates (Weighted), 2011-2016"
+            , position = "bottomright"
+            ) %>%     
+  addLegend(group = "Unweighted Estimates", pal = pal_unweighted
+            , values = ~ttl_expected_placement_rate, opacity = 0.7
+            , title = "Mean Removal Rates (Unweighted), 2011-2016"
+            , position = "bottomright"
+            ) %>% 
+  addLayersControl(position = "topright", overlayGroups = c("Unweighted Estimates"
+                                                            ,"Weighted Estimates"),
+                   options = layersControlOptions(collapsed = FALSE)) %>%
+  hideGroup(group = c("Unweighted Estimates"))
+
+saveRDS(m, "map.rds")
+
+```
+
+The interactive map produced by this code is available at (my link).
