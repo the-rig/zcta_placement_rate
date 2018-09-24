@@ -1,5 +1,5 @@
 ---
-title: "Calculating Foster Care Placement Rates by ZCTA in Washington STate"
+title: "Calculating Foster Care Placement Rates by ZCTA in Washington State"
 output:
   html_document:
     theme: united
@@ -19,7 +19,7 @@ Here, we outline the calculation of Placement Rates, by ZCTA using the statistic
 
 ## Load Libraries 
 
-The first chunk of code below loads necessary libraries and defines some objects which will be used throughout the analysis. The DSN will specified will depend on how a particular reader connects to the FamLink Data Warehouse. Individual API keys for the US Census can be found here: [https://api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html).
+The first two chunks of code below loads necessary libraries and defines some objects which will be used throughout the analysis. The DSN specified will depend on how a particular reader connects to the FamLink Data Warehouse. Individual API keys for the US Census can be found here: [https://api.census.gov/data/key_signup.html](https://api.census.gov/data/key_signup.html).
 
 ```{r load_libraries, message=FALSE, warning=FALSE}
 library(tidycensus) # to connect to the Census API
@@ -35,11 +35,15 @@ library(feather) # for storing data
 library(dplyr) # for data wrangling 
 library(ggplot2) # for plotting
 
+```
+
+```{r load_connections, message=FALSE, warning=FALSE, eval=FALSE}
+
 # define a connection to the DSN "POC" - this is the DB where our FLDW extract is stored
 con <- dbConnect(odbc::odbc(), "POC")
 
 #tell your R install where your Census API key is located
-#census_api_key("YourCensusAPIKey", install = TRUE) #only run once
+census_api_key("YourCensusAPIKey", install = TRUE) #only run once
 
 ```
 
@@ -47,7 +51,7 @@ con <- dbConnect(odbc::odbc(), "POC")
 
 Since Zip Codes (what we have recorded in FamLink) and ZCTAs (what the Census uses to categorize data) do not align perfectly, we also obtain a crosswalk available to the public from HRSA's [UDS Mapper Project](https://www.udsmapper.org/about.cfm). 
 
-```{r zcta_cross_walk, message=FALSE, warning=FALSE}
+```{r zcta_cross_walk, message=FALSE, warning=FALSE, eval=FALSE}
 xwalk_url <- "https://www.udsmapper.org/docs/zip_to_zcta_2018.xlsx"
 xwalk_file <- GET(xwalk_url, write_disk(tf <- tempfile(fileext = ".xlsx"), overwrite = TRUE))
 dat_xwalk <- readxl::read_excel(tf)
@@ -61,7 +65,7 @@ write_feather(dat_xwalk, xwalk_path)
 
 The next section generates placement counts from the aforementioned FLDW. We then join those results to the ZCTA crosswalk. The inner join will exclude any FamLink zip codes which are either not specified or missing. Recent analysis suggests that FamLink placements have valid origin zip codes (i.e. the zip code from which the child was originally removed) for about 95% of placements. 
 
-```{r zcta_placement_counts, message=FALSE, warning=FALSE}
+```{r zcta_placement_counts, message=FALSE, warning=FALSE, eval=FALSE}
 # get placement counts, and join to zcta cross-walk
 # the result of this inner join is a placement count for 
 # all valid zip codes in FamLink (about 95% of placements)
@@ -204,7 +208,7 @@ write_feather(placement_counts, pc_path)
 
 ## Get Population Data
 
-The next section generates population estimates from the US Census. We specifically make use of the 5-year ACS estimates. As of the date of this writing, the most recent ACS data available are 2016. 
+The next section generates population estimates from the US Census. We specifically make use of the 5-year ACS estimates. As of the date of this writing, the most recent ACS data available are 2016. The variables listed in the code chunk correspond to the age groupings defined in the FamLink extract above. 
 
 ```{r zcta_pop_counts, message=FALSE, warning=FALSE, cache=TRUE, eval=FALSE}
 
@@ -238,16 +242,16 @@ write_feather(bind_rows(zctalist), path)
 
 Our next chunk joins the census and FamLink data together. We first rename the fields in each file together to make clear that we are conducting a ZCTA analysis, not a ZIP-code analysis. The `left_join` function joins the two data sets together on the year, zcta, and variable fields. We then average the population and placement counts across all of the years of data, and then sum across the age categories. 
 
-After cleaning up those aggregations which come from low population ZCTAs, we finally calculate an expected removal rate.
+After cleaning up those aggregations which come from low population ZCTAs, we finally calculate an expected removal rate, which also needs to be cleaned up to handle small population ZCTAs.
 
 ```{r zcta_aggr_counts, message=FALSE, warning=FALSE, cache=TRUE}
 
 zcta_counts <- read_feather("zcta_counts.feather") %>%
   rename(zcta = GEOID)
 
-placement_counts <- placement_counts %>%
+placement_counts <- read_feather("placement_counts.feather") %>%
   rename(zcta = ZCTA)
- 
+
 dat_aggr <- left_join(zcta_counts, placement_counts) %>%
   group_by(zcta, variable) %>%
   # average across years
@@ -278,7 +282,7 @@ write_feather(dat_aggr, path)
 
 Since ZCTAs are somewhat arbitrary boundaries, we take an additional step of weighting the rates calculated above by neighboring ZCTAs. In order to complete this task, we first load some ZCTA boundary data, also available from the US Census.
 
-We next calculate the centroid of each ZCTA in the boundary file. We then find near neighbors to each ZCTA centroid. We specifically look for any ZCTA that is within 20 km of another ZCTA. For each ZCTA, the vector of inverse distances (i.e. 1/distance) for each neighbor is multiplied against the placement rate for the neighbor. All values (along with the value for the ZCTA in question) are then averaged together. The result, for each ZCTA is a weighted average of local placement rates.
+We next calculate the centroid of each ZCTA in the boundary file. We then find near neighbors to each centroid. We specifically look for any ZCTA that is within 20 km of another ZCTA. For each ZCTA, the vector of inverse distances (i.e. 1/distance) for each neighbor is multiplied against the placement rate for the neighbor. All values (along with the value for the ZCTA in question) are then averaged together. The result, for each ZCTA is a spatially weighted average of local placement rates.
 
 These new calculations (along with the unweighted calculations) are then combined with the ZCTA boundary data for plotting. 
 
@@ -377,7 +381,6 @@ write_feather(wa_clean@data, "weighted_and_raw.feather")
 
 We first plot the unweighted values. 
 
-
 ```{r zcta_plotting_ggplot, message=FALSE, warning=FALSE, cache=TRUE, fig.width=10,fig.height=11}
 
 ggplot(wa_fort, aes(x = long
@@ -475,7 +478,7 @@ mu <- wa$ttl_expected_placement_rate %>% mean
 lambda <- wa$ttl_expected_placement_rate %>% sd
 
 m <- leaflet(wa) %>% 
-  addProviderTiles(providers$OpenStreetMap.BlackAndWhite) %>%
+  addTiles() %>%
   setView(lng = -120.7401, lat = 47.5, zoom = 6.5) %>% 
   addCircleMarkers(group = "Weighted Estimates"
                    ,radius = ~(5*exp(avg_weighted_placement_rate-mu/1.5*lambda))
@@ -512,12 +515,11 @@ m <- leaflet(wa) %>%
             , position = "bottomright"
             ) %>% 
   addLayersControl(position = "topright", overlayGroups = c("Unweighted Estimates"
-                                                            ,"Weighted Estimates"),
-                   options = layersControlOptions(collapsed = FALSE)) %>%
+                                                            ,"Weighted Estimates")) %>%
   hideGroup(group = c("Unweighted Estimates"))
 
 saveRDS(m, "map.rds")
 
 ```
 
-The interactive map produced by this code is available at (my link).
+The interactive map produced by the last chunk of code is available at (https://pocdata.shinyapps.io/zcta_placement_rate/). 
